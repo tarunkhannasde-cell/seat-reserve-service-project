@@ -1,0 +1,2357 @@
+{
+  "variable": [
+    {
+      "value": "http://localhost:8080",
+      "key": "baseUrl"
+    },
+    {
+      "value": "dev-admin-key",
+      "key": "adminKey"
+    },
+    {
+      "value": "",
+      "key": "runId"
+    },
+    {
+      "value": "",
+      "key": "showId"
+    },
+    {
+      "value": "",
+      "key": "aliceToken"
+    },
+    {
+      "value": "",
+      "key": "bobToken"
+    },
+    {
+      "value": "",
+      "key": "aliceReservationId"
+    },
+    {
+      "value": "",
+      "key": "bobReservationId"
+    },
+    {
+      "value": "",
+      "key": "bobReservationId2"
+    }
+  ],
+  "event": [
+    {
+      "listen": "test",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Shared structural checks, available to every request as pm.globals-free helpers.",
+          "pm.test(\"has X-Request-Id correlation header\", function () {",
+          "    pm.expect(pm.response.headers.get(\"X-Request-Id\"), \"X-Request-Id\").to.be.a(\"string\").and.not.empty;",
+          "});",
+          "pm.test(\"never a 5xx\", function () {",
+          "    pm.expect(pm.response.code).to.be.below(500);",
+          "});"
+        ]
+      }
+    }
+  ],
+  "info": {
+    "name": "seat-booking-service",
+    "description": "Every endpoint of the seat booking API. Asserts response STRUCTURE (plus status and domain reason codes), uses unique users/keys per run ({{runId}}), and cancels everything it reserved in '5. Teardown'. Run in order: newman run postman/seat-booking.postman_collection.json -e postman/local.postman_environment.json",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "0. Setup",
+      "item": [
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 UP\", function () { pm.response.to.have.status(200); pm.expect(pm.response.json()).to.have.property(\"status\"); });"
+                ]
+              }
+            }
+          ],
+          "name": "Liveness",
+          "request": {
+            "header": [],
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "livez"
+              ],
+              "raw": "{{baseUrl}}/livez"
+            },
+            "method": "GET"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 UP\", function () { pm.response.to.have.status(200); });",
+                  "pm.test(\"has database component\", function () {",
+                  "    var b = pm.response.json();",
+                  "    pm.expect(b).to.have.property(\"status\");",
+                  "    pm.expect(b.components).to.have.property(\"database\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "name": "Readiness (checks DB)",
+          "request": {
+            "header": [],
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "readyz"
+              ],
+              "raw": "{{baseUrl}}/readyz"
+            },
+            "method": "GET"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// unique data per run: every user id, idempotency key and show name embeds runId",
+                  "pm.collectionVariables.set(\"runId\", Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "",
+                  "pm.test(\"201 Created\", function () { pm.response.to.have.status(201); });",
+                  "pm.test(\"show shape + invariant\", function () { expectShow(pm.response.json()); });",
+                  "pm.collectionVariables.set(\"showId\", pm.response.json().id);"
+                ]
+              }
+            }
+          ],
+          "name": "Create show (admin)",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              },
+              {
+                "value": "{{adminKey}}",
+                "key": "X-Admin-Key"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"per_user_limit\": 4,\n  \"name\": \"postman-{{runId}}\",\n  \"price_paise\": 25000,\n  \"seats\": [\n    \"A1\",\n    \"A2\",\n    \"A3\",\n    \"A4\",\n    \"A5\",\n    \"A6\"\n  ]\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows"
+              ],
+              "raw": "{{baseUrl}}/shows"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "expectError(401, \"unauthorized\");"
+                ]
+              }
+            }
+          ],
+          "name": "Create show without admin key -> 401",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"name\": \"x\",\n  \"price_paise\": 1,\n  \"seats\": [\n    \"A1\"\n  ]\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows"
+              ],
+              "raw": "{{baseUrl}}/shows"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "expectError(400, \"invalid_request\");"
+                ]
+              }
+            }
+          ],
+          "name": "Create show with float price -> 400",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              },
+              {
+                "value": "{{adminKey}}",
+                "key": "X-Admin-Key"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"name\": \"x\",\n  \"price_paise\": 250.5,\n  \"seats\": [\n    \"A1\"\n  ]\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows"
+              ],
+              "raw": "{{baseUrl}}/shows"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 + token shape\", function () {",
+                  "    pm.response.to.have.status(200);",
+                  "    var b = pm.response.json();",
+                  "    pm.expect(b).to.have.all.keys(\"user_id\", \"token\", \"token_type\");",
+                  "    pm.expect(b.token.split(\".\").length, \"JWT has 3 parts\").to.eql(3);",
+                  "});",
+                  "pm.collectionVariables.set(\"aliceToken\", pm.response.json().token);"
+                ]
+              }
+            }
+          ],
+          "name": "Token: alice",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"user_id\": \"alice-{{runId}}\"\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "token"
+              ],
+              "raw": "{{baseUrl}}/auth/token"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200\", function () { pm.response.to.have.status(200); });",
+                  "pm.collectionVariables.set(\"bobToken\", pm.response.json().token);"
+                ]
+              }
+            }
+          ],
+          "name": "Token: bob",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"user_id\": \"bob-{{runId}}\"\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "token"
+              ],
+              "raw": "{{baseUrl}}/auth/token"
+            },
+            "method": "POST"
+          }
+        }
+      ]
+    },
+    {
+      "name": "1. Reserve",
+      "item": [
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "",
+                  "pm.test(\"201 Created\", function () { pm.response.to.have.status(201); });",
+                  "pm.test(\"reservation shape\", function () { expectReservation(pm.response.json()); });",
+                  "pm.test(\"identity comes from the token, not the body\", function () {",
+                  "    pm.expect(pm.response.json().user_id).to.eql(\"alice-\" + pm.collectionVariables.get(\"runId\"));",
+                  "});",
+                  "pm.collectionVariables.set(\"aliceReservationId\", pm.response.json().reservation_id);"
+                ]
+              }
+            }
+          ],
+          "name": "Alice reserves A1 (spoofed user_id in body is ignored) -> 201",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              },
+              {
+                "value": "Bearer {{aliceToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"idempotency_key\": \"{{runId}}-alice-1\",\n  \"seats\": [\n    \"A1\"\n  ],\n  \"user_id\": \"bob-{{runId}}\"\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ],
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "",
+                  "pm.test(\"200 OK (replay, not a second 201)\", function () { pm.response.to.have.status(200); });",
+                  "pm.test(\"Idempotent-Replayed header\", function () { pm.expect(pm.response.headers.get(\"Idempotent-Replayed\")).to.eql(\"true\"); });",
+                  "pm.test(\"reservation shape\", function () { expectReservation(pm.response.json()); });",
+                  "pm.test(\"same reservation as the original\", function () {",
+                  "    pm.expect(pm.response.json().reservation_id).to.eql(pm.collectionVariables.get(\"aliceReservationId\"));",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "name": "Alice retries same key -> 200 replay of the original",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              },
+              {
+                "value": "Bearer {{aliceToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"idempotency_key\": \"{{runId}}-alice-1\",\n  \"seats\": [\n    \"A1\"\n  ]\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ],
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "expectError(409, \"idempotency_key_conflict\");"
+                ]
+              }
+            }
+          ],
+          "name": "Alice reuses key with different seats -> 409",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              },
+              {
+                "value": "Bearer {{aliceToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"idempotency_key\": \"{{runId}}-alice-1\",\n  \"seats\": [\n    \"A2\"\n  ]\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ],
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "",
+                  "expectError(409, \"seat_taken\");",
+                  "pm.test(\"lists the taken seats\", function () { pm.expect(pm.response.json().seats).to.be.an(\"array\").that.is.not.empty; });"
+                ]
+              }
+            }
+          ],
+          "name": "Bob wants A1 (taken) -> 409",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              },
+              {
+                "value": "Bearer {{bobToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"idempotency_key\": \"{{runId}}-bob-1\",\n  \"seats\": [\n    \"A1\"\n  ]\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ],
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "expectError(409, \"seat_taken\");"
+                ]
+              }
+            }
+          ],
+          "name": "Bob wants A1+A2 (one taken) -> 409, all-or-nothing",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              },
+              {
+                "value": "Bearer {{bobToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"idempotency_key\": \"{{runId}}-bob-2\",\n  \"seats\": [\n    \"A2\",\n    \"A1\"\n  ]\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ],
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "expectError(409, \"per_user_limit\");"
+                ]
+              }
+            }
+          ],
+          "name": "Bob wants 5 seats (limit 4) -> 409",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              },
+              {
+                "value": "Bearer {{bobToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"idempotency_key\": \"{{runId}}-bob-3\",\n  \"seats\": [\n    \"A2\",\n    \"A3\",\n    \"A4\",\n    \"A5\",\n    \"A6\"\n  ]\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ],
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "expectError(422, \"unknown_seat\");"
+                ]
+              }
+            }
+          ],
+          "name": "Unknown seat -> 422",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              },
+              {
+                "value": "Bearer {{bobToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"idempotency_key\": \"{{runId}}-bob-4\",\n  \"seats\": [\n    \"Z99\"\n  ]\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ],
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "expectError(400, \"invalid_request\");"
+                ]
+              }
+            }
+          ],
+          "name": "Missing idempotency key -> 400",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              },
+              {
+                "value": "Bearer {{bobToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"seats\": [\n    \"A3\"\n  ]\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ],
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "expectError(401, \"unauthorized\");"
+                ]
+              }
+            }
+          ],
+          "name": "No token -> 401",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"idempotency_key\": \"{{runId}}-anon\",\n  \"seats\": [\n    \"A3\"\n  ]\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ],
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "",
+                  "pm.test(\"201 Created\", function () { pm.response.to.have.status(201); });",
+                  "pm.test(\"reservation shape\", function () { expectReservation(pm.response.json()); });",
+                  "pm.collectionVariables.set(\"bobReservationId\", pm.response.json().reservation_id);"
+                ]
+              }
+            }
+          ],
+          "name": "Bob reserves A2+A3 via Idempotency-Key header -> 201",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              },
+              {
+                "value": "Bearer {{bobToken}}",
+                "key": "Authorization"
+              },
+              {
+                "value": "{{runId}}-bob-5",
+                "key": "Idempotency-Key"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"seats\": [\n    \"A2\",\n    \"A3\"\n  ]\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ],
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve"
+            },
+            "method": "POST"
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Read",
+      "item": [
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "",
+                  "pm.test(\"200\", function () { pm.response.to.have.status(200); });",
+                  "pm.test(\"show shape + invariant\", function () { expectShow(pm.response.json()); });"
+                ]
+              }
+            }
+          ],
+          "name": "Show state (per-seat status + counts)",
+          "request": {
+            "header": [],
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}"
+              ],
+              "raw": "{{baseUrl}}/shows/{{showId}}"
+            },
+            "method": "GET"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "",
+                  "pm.test(\"200\", function () { pm.response.to.have.status(200); });",
+                  "pm.test(\"reservation shape\", function () { expectReservation(pm.response.json()); });"
+                ]
+              }
+            }
+          ],
+          "name": "Alice reads her reservation -> 200",
+          "request": {
+            "header": [
+              {
+                "value": "Bearer {{aliceToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{aliceReservationId}}"
+              ],
+              "raw": "{{baseUrl}}/reservations/{{aliceReservationId}}"
+            },
+            "method": "GET"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "expectError(404, \"reservation_not_found\");"
+                ]
+              }
+            }
+          ],
+          "name": "Bob reads Alice's reservation -> 404",
+          "request": {
+            "header": [
+              {
+                "value": "Bearer {{bobToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{aliceReservationId}}"
+              ],
+              "raw": "{{baseUrl}}/reservations/{{aliceReservationId}}"
+            },
+            "method": "GET"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "expectError(404, \"show_not_found\");"
+                ]
+              }
+            }
+          ],
+          "name": "Unknown show -> 404",
+          "request": {
+            "header": [],
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "00000000-0000-0000-0000-000000000000"
+              ],
+              "raw": "{{baseUrl}}/shows/00000000-0000-0000-0000-000000000000"
+            },
+            "method": "GET"
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Cancel",
+      "item": [
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "expectError(404, \"reservation_not_found\");"
+                ]
+              }
+            }
+          ],
+          "name": "Bob cancels Alice's reservation -> 404",
+          "request": {
+            "header": [
+              {
+                "value": "Bearer {{bobToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{aliceReservationId}}",
+                "cancel"
+              ],
+              "raw": "{{baseUrl}}/reservations/{{aliceReservationId}}/cancel"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "",
+                  "pm.test(\"200\", function () { pm.response.to.have.status(200); });",
+                  "pm.test(\"reservation shape, now cancelled\", function () {",
+                  "    expectReservation(pm.response.json());",
+                  "    pm.expect(pm.response.json().status).to.eql(\"cancelled\");",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "name": "Alice cancels her reservation -> 200",
+          "request": {
+            "header": [
+              {
+                "value": "Bearer {{aliceToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{aliceReservationId}}",
+                "cancel"
+              ],
+              "raw": "{{baseUrl}}/reservations/{{aliceReservationId}}/cancel"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "",
+                  "pm.test(\"200\", function () { pm.response.to.have.status(200); });",
+                  "pm.test(\"reservation shape\", function () { expectReservation(pm.response.json()); });"
+                ]
+              }
+            }
+          ],
+          "name": "Alice cancels again -> 200 (idempotent)",
+          "request": {
+            "header": [
+              {
+                "value": "Bearer {{aliceToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{aliceReservationId}}",
+                "cancel"
+              ],
+              "raw": "{{baseUrl}}/reservations/{{aliceReservationId}}/cancel"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "",
+                  "pm.test(\"201 Created\", function () { pm.response.to.have.status(201); });",
+                  "pm.test(\"reservation shape\", function () { expectReservation(pm.response.json()); });",
+                  "pm.collectionVariables.set(\"bobReservationId2\", pm.response.json().reservation_id);"
+                ]
+              }
+            }
+          ],
+          "name": "Bob re-books released A1 -> 201",
+          "request": {
+            "header": [
+              {
+                "value": "application/json",
+                "key": "Content-Type"
+              },
+              {
+                "value": "Bearer {{bobToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              },
+              "raw": "{\n  \"idempotency_key\": \"{{runId}}-bob-6\",\n  \"seats\": [\n    \"A1\"\n  ]\n}"
+            },
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}",
+                "reserve"
+              ],
+              "raw": "{{baseUrl}}/shows/{{showId}}/reserve"
+            },
+            "method": "POST"
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Observability",
+      "item": [
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 text exposition\", function () { pm.response.to.have.status(200); });",
+                  "pm.test(\"business metrics exported\", function () {",
+                  "    var text = pm.response.text();",
+                  "    [\"reservations_confirmed_total\", \"reservations_declined_total\", \"seats_sold_total\",",
+                  "     \"seats_available\", \"seats_confirmed\", \"seat_invariant_violations\"].forEach(function (m) {",
+                  "        pm.expect(text, m).to.include(m);",
+                  "    });",
+                  "});",
+                  "pm.test(\"invariant gauge is 0\", function () {",
+                  "    var m = pm.response.text().match(/^seat_invariant_violations\\{[^}]*\\} (\\S+)$/m);",
+                  "    pm.expect(m, \"seat_invariant_violations present\").to.not.be.null;",
+                  "    pm.expect(parseFloat(m[1])).to.eql(0);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "name": "Prometheus metrics",
+          "request": {
+            "header": [],
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "actuator",
+                "prometheus"
+              ],
+              "raw": "{{baseUrl}}/actuator/prometheus"
+            },
+            "method": "GET"
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Teardown",
+      "item": [
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "pm.test(\"200\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "name": "Teardown: cancel Bob's A2+A3",
+          "request": {
+            "header": [
+              {
+                "value": "Bearer {{bobToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{bobReservationId}}",
+                "cancel"
+              ],
+              "raw": "{{baseUrl}}/reservations/{{bobReservationId}}/cancel"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "pm.test(\"200\", function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "name": "Teardown: cancel Bob's A1",
+          "request": {
+            "header": [
+              {
+                "value": "Bearer {{bobToken}}",
+                "key": "Authorization"
+              }
+            ],
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "reservations",
+                "{{bobReservationId2}}",
+                "cancel"
+              ],
+              "raw": "{{baseUrl}}/reservations/{{bobReservationId2}}/cancel"
+            },
+            "method": "POST"
+          }
+        },
+        {
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "function expectReservation(r) {",
+                  "    pm.expect(r).to.have.all.keys(\"reservation_id\", \"show_id\", \"user_id\", \"seats\", \"amount_paise\", \"status\", \"created_at\");",
+                  "    pm.expect(r.reservation_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.show_id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(r.user_id).to.be.a(\"string\");",
+                  "    pm.expect(r.seats).to.be.an(\"array\").that.is.not.empty;",
+                  "    r.seats.forEach(function (s) { pm.expect(s).to.be.a(\"string\"); });",
+                  "    pm.expect(r.amount_paise).to.be.a(\"number\");",
+                  "    pm.expect(Number.isInteger(r.amount_paise), \"amount_paise is integer paise\").to.be.true;",
+                  "    pm.expect(r.status).to.be.oneOf([\"confirmed\", \"cancelled\"]);",
+                  "    pm.expect(r.created_at).to.be.a(\"string\");",
+                  "}",
+                  "",
+                  "function expectError(code, reason) {",
+                  "    pm.test(\"status \" + code, function () { pm.response.to.have.status(code); });",
+                  "    pm.test(\"error body shape\", function () {",
+                  "        var b = pm.response.json();",
+                  "        pm.expect(b).to.include.all.keys(\"error\", \"message\", \"request_id\");",
+                  "        pm.expect(b.error).to.be.a(\"string\");",
+                  "        pm.expect(b.message).to.be.a(\"string\");",
+                  "        pm.expect(b.request_id).to.eql(pm.response.headers.get(\"X-Request-Id\"));",
+                  "        if (reason) { pm.expect(b.error, \"reason code\").to.eql(reason); }",
+                  "    });",
+                  "}",
+                  "",
+                  "function expectShow(s) {",
+                  "    pm.expect(s).to.have.all.keys(\"id\", \"name\", \"price_paise\", \"per_user_limit\", \"total_seats\", \"counts\", \"reconciled\", \"seats\");",
+                  "    pm.expect(s.id).to.be.a(\"string\").and.match(/^[0-9a-f-]{36}$/);",
+                  "    pm.expect(s.name).to.be.a(\"string\");",
+                  "    pm.expect(Number.isInteger(s.price_paise), \"price_paise integer\").to.be.true;",
+                  "    pm.expect(s.per_user_limit).to.be.a(\"number\");",
+                  "    pm.expect(s.total_seats).to.be.a(\"number\");",
+                  "    pm.expect(s.counts).to.have.all.keys(\"available\", \"held\", \"confirmed\", \"total\");",
+                  "    Object.keys(s.counts).forEach(function (k) { pm.expect(s.counts[k], k).to.be.a(\"number\"); });",
+                  "    pm.expect(s.reconciled).to.be.a(\"boolean\");",
+                  "    pm.expect(s.seats).to.be.an(\"array\").with.lengthOf(s.total_seats);",
+                  "    s.seats.forEach(function (x) {",
+                  "        pm.expect(x).to.have.all.keys(\"seat\", \"status\");",
+                  "        pm.expect(x.status).to.be.oneOf([\"available\", \"held\", \"confirmed\"]);",
+                  "    });",
+                  "    // reconciliation invariant",
+                  "    pm.expect(s.counts.available + s.counts.held + s.counts.confirmed, \"available+held+confirmed\").to.eql(s.counts.total);",
+                  "    pm.expect(s.reconciled).to.be.true;",
+                  "}",
+                  "",
+                  "pm.test(\"show shape + invariant\", function () { expectShow(pm.response.json()); });",
+                  "pm.test(\"no seats left confirmed or held\", function () {",
+                  "    var c = pm.response.json().counts;",
+                  "    pm.expect(c.confirmed + c.held).to.eql(0);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "name": "Teardown: every seat available again",
+          "request": {
+            "header": [],
+            "url": {
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "shows",
+                "{{showId}}"
+              ],
+              "raw": "{{baseUrl}}/shows/{{showId}}"
+            },
+            "method": "GET"
+          }
+        }
+      ]
+    }
+  ]
+}

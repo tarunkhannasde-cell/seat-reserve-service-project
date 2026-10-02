@@ -1,0 +1,46 @@
+# Clean-checkout run, same image as the Railway deploy:
+#   docker compose up --build        -> API on http://localhost:8080
+#   ./burst.sh http://localhost:8080
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: seats
+      MYSQL_USER: seats
+      MYSQL_PASSWORD: ${DB_PASSWORD:-seats}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root-change-me}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_bin
+      - --max-connections=500
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      - "127.0.0.1:3308:3306"   # host access for debugging only; never exposed publicly
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -useats -p$$MYSQL_PASSWORD --silent"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    restart: unless-stopped
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      MYSQLHOST: db
+      MYSQLPORT: 3306
+      MYSQLDATABASE: seats
+      MYSQLUSER: seats
+      MYSQLPASSWORD: ${DB_PASSWORD:-seats}
+      ADMIN_KEY: ${ADMIN_KEY:-dev-admin-key}
+      AUTH_SECRET: ${AUTH_SECRET:-compose-dev-secret-0123456789abcdefghijklmnop}
+      AUTH_DEV_ISSUER_ENABLED: "true"
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+volumes:
+  mysql-data:

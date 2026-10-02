@@ -29,6 +29,37 @@ To run without Docker you need JDK 21 and a MySQL 8+ server. Set `MYSQLHOST`, `M
 ```
 Flyway creates the schema on first start.
 
+## Quick start (curl)
+
+`ADMIN_KEY` is a secret you set in the environment, not something the server issues. Generate one with
+`openssl rand -hex 32` and set it as the `ADMIN_KEY` variable (locally it defaults to `dev-admin-key`).
+User tokens are minted by the server through `POST /auth/token`, which only works while
+`AUTH_DEV_ISSUER_ENABLED=true`.
+
+```bash
+BASE=https://seat-reserve-service-project-production.up.railway.app   # or http://localhost:8080
+ADMIN_KEY=<your admin key>
+
+# 1. create a show (admin)
+curl -s -X POST $BASE/shows -H 'Content-Type: application/json' -H "X-Admin-Key: $ADMIN_KEY" \
+  -d '{"name":"friday-night","seats":["A1","A2","A3"],"price_paise":25000}'
+#   -> {"id":"<show_id>", ..., "counts":{"available":3,"held":0,"confirmed":0,"total":3}, ...}
+
+# 2. mint a user token (signed HS256 JWT, valid 12h)
+curl -s -X POST $BASE/auth/token -H 'Content-Type: application/json' -d '{"user_id":"alice"}'
+#   -> {"token":"<jwt>", ...}
+
+# 3. reserve (identity comes from the token, never the body)
+curl -s -X POST $BASE/shows/<show_id>/reserve -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <jwt>' -d '{"seats":["A1"],"idempotency_key":"order-1"}'
+#   -> 201 {"reservation_id":"…","seats":["A1"],"amount_paise":25000,"status":"confirmed", ...}
+#      same request again -> 200 replay (Idempotent-Replayed: true)
+
+# 4. show state, then cancel
+curl -s $BASE/shows/<show_id>
+curl -s -X POST $BASE/reservations/<reservation_id>/cancel -H 'Authorization: Bearer <jwt>'
+```
+
 ## One-command burst
 
 ```bash
@@ -63,9 +94,11 @@ Latest results:
 | target | load | result |
 |---|---|---|
 | `docker compose`, clean checkout | 20,000 requests, concurrency 1,000, storm 500 × 5 seats | **13/13 PASS**, 0 × 5xx, 2,024 req/s, p99 2.3 s |
-| Railway (live) | 5,000 requests, concurrency 300, storm 200 × 5 seats | 0 × 5xx, all invariant/correctness checks pass |
+| Railway (live) | 5,000 requests, concurrency 300, storm 200 × 5 seats | 0 × 5xx, all invariant/correctness checks pass ¹ |
 
-
+¹ That run came from a corporate network that drops some outbound connections under load. 32 requests
+never connected, which tripped the two "every request got an answer" checks. The server returned no
+5xx and no seat had more than one winner.
 
 ## API
 
